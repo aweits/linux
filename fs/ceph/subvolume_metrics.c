@@ -31,14 +31,36 @@ struct ceph_subvol_metric_rb_entry {
 	u64 write_latency_us;
 };
 
+/**
+ * struct ceph_subvol_metric_pcpu - Per-CPU accumulator in front of the tree
+ * @lock: Protects @m; only contended when a task migrates mid-update
+ * @m: Counters of one subvolume (@m.subvolume_id) not yet folded into the tree
+ *
+ * I/O completions add to the slot of the CPU they run on and only take
+ * tracker->lock when the slot holds another subvolume, or when a snapshot
+ * or a dump folds every slot into the tree.
+ */
+struct ceph_subvol_metric_pcpu {
+	spinlock_t lock;
+	struct ceph_subvol_metric_snapshot m;
+};
+
 static struct kmem_cache *ceph_subvol_metric_entry_cachep;
 
-void ceph_subvolume_metrics_init(struct ceph_subvolume_metrics_tracker *tracker)
+int ceph_subvolume_metrics_init(struct ceph_subvolume_metrics_tracker *tracker)
 {
+	int cpu;
+
 	spin_lock_init(&tracker->lock);
 	tracker->tree = RB_ROOT_CACHED;
 	tracker->nr_entries = 0;
 	tracker->enabled = false;
+	tracker->pcpu = alloc_percpu(struct ceph_subvol_metric_pcpu);
+	if (!tracker->pcpu)
+		return -ENOMEM;
+	for_each_possible_cpu(cpu)
+		spin_lock_init(&per_cpu_ptr(tracker->pcpu, cpu)->lock);
+	return 0;
 }
 
 static struct ceph_subvol_metric_rb_entry *
@@ -109,12 +131,28 @@ static void ceph_subvolume_metrics_clear_locked(
 	tracker->tree = RB_ROOT_CACHED;
 }
 
+static void ceph_subvolume_metrics_clear_pcpu(
+		struct ceph_subvolume_metrics_tracker *tracker)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct ceph_subvol_metric_pcpu *pc = per_cpu_ptr(tracker->pcpu, cpu);
+
+		spin_lock(&pc->lock);
+		memset(&pc->m, 0, sizeof(pc->m));
+		spin_unlock(&pc->lock);
+	}
+}
+
 void ceph_subvolume_metrics_destroy(struct ceph_subvolume_metrics_tracker *tracker)
 {
 	spin_lock(&tracker->lock);
 	ceph_subvolume_metrics_clear_locked(tracker);
 	tracker->enabled = false;
 	spin_unlock(&tracker->lock);
+	free_percpu(tracker->pcpu);
+	tracker->pcpu = NULL;
 }
 
 void ceph_subvolume_metrics_enable(struct ceph_subvolume_metrics_tracker *tracker,
@@ -128,19 +166,19 @@ void ceph_subvolume_metrics_enable(struct ceph_subvolume_metrics_tracker *tracke
 		ceph_subvolume_metrics_clear_locked(tracker);
 	}
 	spin_unlock(&tracker->lock);
+	if (!enable)
+		ceph_subvolume_metrics_clear_pcpu(tracker);
 }
 
-void ceph_subvolume_metrics_record(struct ceph_subvolume_metrics_tracker *tracker,
-				   u64 subvol_id, bool is_write,
-				   size_t size, u64 latency_us)
+/*
+ * Add the counters of one subvolume taken out of a per-CPU slot to its
+ * entry in the tree.
+ */
+static void ceph_subvolume_metrics_fold(struct ceph_subvolume_metrics_tracker *tracker,
+					const struct ceph_subvol_metric_snapshot *d)
 {
 	struct ceph_subvol_metric_rb_entry *entry, *new_entry = NULL;
 	bool retry = false;
-
-	/* CEPH_SUBVOLUME_ID_NONE (0) means unknown/unset subvolume */
-	if (!READ_ONCE(tracker->enabled) ||
-	    subvol_id == CEPH_SUBVOLUME_ID_NONE || !size || !latency_us)
-		return;
 
 	/*
 	 * Retry loop for lock-free allocation pattern:
@@ -158,7 +196,7 @@ void ceph_subvolume_metrics_record(struct ceph_subvolume_metrics_tracker *tracke
 			return;
 		}
 
-		entry = __lookup_entry(tracker, subvol_id);
+		entry = __lookup_entry(tracker, d->subvolume_id);
 		if (!entry) {
 			if (!new_entry) {
 				spin_unlock(&tracker->lock);
@@ -166,7 +204,7 @@ void ceph_subvolume_metrics_record(struct ceph_subvolume_metrics_tracker *tracke
 						      GFP_NOFS);
 				if (!new_entry)
 					return;
-				new_entry->subvolume_id = subvol_id;
+				new_entry->subvolume_id = d->subvolume_id;
 				retry = true;
 				continue;
 			}
@@ -182,20 +220,77 @@ void ceph_subvolume_metrics_record(struct ceph_subvolume_metrics_tracker *tracke
 			new_entry = NULL;
 		}
 
-		if (is_write) {
-			entry->write_ops++;
-			entry->write_bytes += size;
-			entry->write_latency_us += latency_us;
-		} else {
-			entry->read_ops++;
-			entry->read_bytes += size;
-			entry->read_latency_us += latency_us;
-		}
+		entry->read_ops += d->read_ops;
+		entry->read_bytes += d->read_bytes;
+		entry->read_latency_us += d->read_latency_us;
+		entry->write_ops += d->write_ops;
+		entry->write_bytes += d->write_bytes;
+		entry->write_latency_us += d->write_latency_us;
 		spin_unlock(&tracker->lock);
 		if (new_entry)
 			kmem_cache_free(ceph_subvol_metric_entry_cachep, new_entry);
 		return;
 	} while (retry);
+}
+
+/* Move what every per-CPU slot holds into the tree. */
+static void ceph_subvolume_metrics_fold_pcpu(
+		struct ceph_subvolume_metrics_tracker *tracker)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct ceph_subvol_metric_pcpu *pc = per_cpu_ptr(tracker->pcpu, cpu);
+		struct ceph_subvol_metric_snapshot d;
+
+		spin_lock(&pc->lock);
+		d = pc->m;
+		memset(&pc->m, 0, sizeof(pc->m));
+		pc->m.subvolume_id = d.subvolume_id;
+		spin_unlock(&pc->lock);
+
+		if (d.read_ops || d.write_ops)
+			ceph_subvolume_metrics_fold(tracker, &d);
+	}
+}
+
+void ceph_subvolume_metrics_record(struct ceph_subvolume_metrics_tracker *tracker,
+				   u64 subvol_id, bool is_write,
+				   size_t size, u64 latency_us)
+{
+	struct ceph_subvol_metric_snapshot old = {};
+	struct ceph_subvol_metric_pcpu *pc;
+
+	/* CEPH_SUBVOLUME_ID_NONE (0) means unknown/unset subvolume */
+	if (!READ_ONCE(tracker->enabled) ||
+	    subvol_id == CEPH_SUBVOLUME_ID_NONE || !size || !latency_us)
+		return;
+
+	/*
+	 * The slot of the CPU we start on; if we migrate, the lock still
+	 * keeps the update consistent and it just lands in another slot.
+	 */
+	pc = raw_cpu_ptr(tracker->pcpu);
+	spin_lock(&pc->lock);
+	if (unlikely(pc->m.subvolume_id != subvol_id)) {
+		old = pc->m;
+		memset(&pc->m, 0, sizeof(pc->m));
+		pc->m.subvolume_id = subvol_id;
+	}
+	if (is_write) {
+		pc->m.write_ops++;
+		pc->m.write_bytes += size;
+		pc->m.write_latency_us += latency_us;
+	} else {
+		pc->m.read_ops++;
+		pc->m.read_bytes += size;
+		pc->m.read_latency_us += latency_us;
+	}
+	spin_unlock(&pc->lock);
+
+	/* the slot held another subvolume: hand its counters to the tree */
+	if (old.read_ops || old.write_ops)
+		ceph_subvolume_metrics_fold(tracker, &old);
 }
 
 int ceph_subvolume_metrics_snapshot(struct ceph_subvolume_metrics_tracker *tracker,
@@ -212,6 +307,8 @@ int ceph_subvolume_metrics_snapshot(struct ceph_subvolume_metrics_tracker *track
 
 	if (!READ_ONCE(tracker->enabled))
 		return 0;
+
+	ceph_subvolume_metrics_fold_pcpu(tracker);
 
 	spin_lock(&tracker->lock);
 	for (node = rb_first_cached(&tracker->tree); node; node = rb_next(node)) {
@@ -305,6 +402,9 @@ void ceph_subvolume_metrics_dump(struct ceph_subvolume_metrics_tracker *tracker,
 {
 	struct rb_node *node;
 	bool found = false;
+
+	if (READ_ONCE(tracker->enabled))
+		ceph_subvolume_metrics_fold_pcpu(tracker);
 
 	spin_lock(&tracker->lock);
 	if (!tracker->enabled) {

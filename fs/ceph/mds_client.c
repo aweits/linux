@@ -6679,7 +6679,9 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	err = ceph_metric_init(&mdsc->metric);
 	if (err)
 		goto err_mdsmap;
-	ceph_subvolume_metrics_init(&mdsc->subvol_metrics);
+	err = ceph_subvolume_metrics_init(&mdsc->subvol_metrics);
+	if (err)
+		goto err_metric;
 	mutex_init(&mdsc->subvol_metrics_last_mutex);
 	mdsc->subvol_metrics_last = NULL;
 	mdsc->subvol_metrics_last_nr = 0;
@@ -6711,6 +6713,8 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	fsc->mdsc = mdsc;
 	return 0;
 
+err_metric:
+	ceph_metric_destroy(&mdsc->metric);
 err_mdsmap:
 	kfree(mdsc->mdsmap);
 err_mdsc:
